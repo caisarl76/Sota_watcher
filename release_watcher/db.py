@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
-from .models import DEFAULT_WANTS, Source, Target
+from .models import DEFAULT_WANTS, Snapshot, Source, Target
 
 
 def utcnow() -> str:
@@ -131,3 +132,61 @@ def notified_categories(conn: sqlite3.Connection, target_id: int) -> set[str]:
         (target_id,),
     )
     return {r["category"] for r in rows}
+
+
+# --- sources: 수집 결과 ------------------------------------------------------
+
+def update_source(conn: sqlite3.Connection, source_id: int, meta: dict, error_count: int) -> None:
+    conn.execute("UPDATE sources SET meta = ?, error_count = ? WHERE id = ?",
+                 (json.dumps(meta), error_count, source_id))
+
+
+def bump_source_error(conn: sqlite3.Connection, source_id: int) -> int:
+    conn.execute("UPDATE sources SET error_count = error_count + 1 WHERE id = ?", (source_id,))
+    return conn.execute("SELECT error_count FROM sources WHERE id = ?", (source_id,)).fetchone()[0]
+
+
+def touch_target(conn: sqlite3.Connection, target_id: int, changed: bool) -> None:
+    now = utcnow()
+    conn.execute("UPDATE targets SET last_checked = ? WHERE id = ?", (now, target_id))
+    if changed:
+        conn.execute("UPDATE targets SET last_change = ? WHERE id = ?", (now, target_id))
+
+
+# --- snapshots ---------------------------------------------------------------
+
+def latest_snapshot(conn: sqlite3.Connection, source_id: int, kind: str) -> Snapshot | None:
+    row = conn.execute(
+        "SELECT * FROM snapshots WHERE source_id = ? AND kind = ? ORDER BY taken_at DESC, id DESC LIMIT 1",
+        (source_id, kind),
+    ).fetchone()
+    if not row:
+        return None
+    return Snapshot(row["source_id"], row["kind"], json.loads(gzip.decompress(row["content_gz"])),
+                    datetime.fromisoformat(row["taken_at"]))
+
+
+def save_snapshot(conn: sqlite3.Connection, snap: Snapshot, keep: int | None = None) -> bool:
+    """직전 스냅샷과 내용이 같으면 저장하지 않는다. Source·kind 당 최근 keep 개만 유지."""
+    keep = keep or config.SNAPSHOT_KEEP
+    h = snap.content_hash
+    last = conn.execute(
+        "SELECT content_hash FROM snapshots WHERE source_id = ? AND kind = ? ORDER BY taken_at DESC, id DESC LIMIT 1",
+        (snap.source_id, snap.kind),
+    ).fetchone()
+    if last and last["content_hash"] == h:
+        return False
+    conn.execute(
+        "INSERT INTO snapshots (source_id, taken_at, kind, content_hash, content_gz) VALUES (?, ?, ?, ?, ?)",
+        (snap.source_id, snap.taken_at.isoformat(timespec="seconds"), snap.kind, h, gzip.compress(snap.canonical())),
+    )
+    conn.execute(
+        """DELETE FROM snapshots WHERE source_id = ? AND kind = ? AND id NOT IN (
+             SELECT id FROM snapshots WHERE source_id = ? AND kind = ? ORDER BY taken_at DESC, id DESC LIMIT ?)""",
+        (snap.source_id, snap.kind, snap.source_id, snap.kind, keep),
+    )
+    return True
+
+
+def count_snapshots(conn: sqlite3.Connection, source_id: int) -> int:
+    return conn.execute("SELECT COUNT(*) FROM snapshots WHERE source_id = ?", (source_id,)).fetchone()[0]

@@ -9,7 +9,7 @@ from typing import Optional
 
 import typer
 
-from . import db, state
+from . import db, runner, state
 from .models import RELEASE_CATEGORIES
 from .resolver import InvalidURL, normalize_url, resolve
 
@@ -53,7 +53,13 @@ def register(conn: sqlite3.Connection, raw_url: str, title: str | None = None,
         db.add_source(conn, tid, src.type, src.url, src.meta)
     # TODO(7단계): 프로젝트 페이지에서 GitHub/HF/arXiv 링크를 추출해 소스 추가
     # TODO(4단계): 등록 직후 1회 분류 → 이미 공개된 대상은 released 로 두고 알리지 않음
-    return AddResult("added", origin, tid, src.type)
+    res = runner.collect_target(conn, db.get_target(conn, tid))
+    note = src.type
+    if res.failed:
+        note += ", 첫 수집 실패 — 다음 주기에 재시도"
+    elif res.transition:
+        note += ", 첫 스냅샷 저장"
+    return AddResult("added", origin, tid, note)
 
 
 def _read_url_file(path: Path) -> list[str]:
@@ -162,6 +168,23 @@ def _transition(target_id: int, fn) -> None:
     with conn:
         db.set_state(conn, t.id, tr.next)
     typer.echo(f"#{t.id} {tr.prev} → {tr.next}")
+
+
+@app.command()
+def collect(target_id: Optional[int] = typer.Option(None, "--target", help="특정 target id만")) -> None:
+    """(개발용) 수집만 실행해 변경 이벤트를 출력한다. 분류·알림·이벤트 기록은 하지 않는다."""
+    conn = db.connect()
+    targets = [_get_or_exit(conn, target_id)] if target_id else [
+        t for t, _ in db.list_targets(conn) if t.state in ("new", *state.ACTIVE_STATES)
+    ]
+    for t in targets:
+        res = runner.collect_target(conn, t)
+        tr = f"  ({res.transition.prev} → {res.transition.next})" if res.transition else ""
+        typer.echo(f"#{t.id} {t.title}: 이벤트 {len(res.events)}건{tr}")
+        for src, err in res.failed:
+            typer.echo(f"  ! {src.url}: {err}", err=True)
+        for e in res.events:
+            typer.echo(f"  {e.kind:<13} {e.summary}")
 
 
 @app.command("pause")

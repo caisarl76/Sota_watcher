@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
@@ -46,11 +48,18 @@ class Source:
 
 @dataclass
 class Snapshot:
+    """Collector 가 한 번 관찰한 Source 상태. data 는 JSON 직렬화 가능해야 한다."""
     source_id: int
-    kind: str  # tree|readme|page_text|hf_files|commits_head
-    content: bytes
+    kind: str  # repo|page_text|hf_files|...
+    data: dict
     taken_at: datetime
-    content_hash: str = ""
+
+    def canonical(self) -> bytes:
+        return json.dumps(self.data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(self.canonical()).hexdigest()
 
 
 @dataclass
